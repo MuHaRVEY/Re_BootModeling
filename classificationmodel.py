@@ -3,104 +3,93 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras import layers, models
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.utils.class_weight import compute_class_weight
-import numpy as np
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
+import numpy as np
 
-# 경로 설정
+# 1. 경로 설정
 train_dir = 'train'
 val_dir = 'valid'
 
-# 데이터 증강 (train에만 적용)
+# 2. 데이터 전처리 및 증강 설정
 train_gen = ImageDataGenerator(
-    rescale=1./255,
-    rotation_range=20,
-    zoom_range=0.2,
+    rescale=1./255,  # 정규화
+    rotation_range=30,
+    zoom_range=0.3,
     width_shift_range=0.2,
     height_shift_range=0.2,
-    shear_range=0.15,
+    shear_range=0.2,
     horizontal_flip=True,
     brightness_range=[0.8, 1.2],
-    channel_shift_range=30.0,
     fill_mode='nearest'
 )
-
 val_gen = ImageDataGenerator(rescale=1./255)
 
+# 3. 이미지 불러오기
 train_data = train_gen.flow_from_directory(
-    train_dir, target_size=(224, 224), batch_size=32, class_mode='categorical'
-)
+    train_dir, target_size=(224, 224), batch_size=32, class_mode='categorical', shuffle=True)
+
 val_data = val_gen.flow_from_directory(
-    val_dir, target_size=(224, 224), batch_size=32, class_mode='categorical'
-)
+    val_dir, target_size=(224, 224), batch_size=32, class_mode='categorical', shuffle=False)
 
-# 클래스 가중치 계산
-labels = train_data.classes
-class_weights = compute_class_weight(
-    class_weight='balanced',
-    classes=np.unique(labels),
-    y=labels
-)
-class_weights = dict(zip(np.unique(labels), class_weights))
-
-# 사전 학습된 모델 불러오기
+# 4. 사전학습된 MobileNetV2 기반 전이학습 (Transfer Learning)
 base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-base_model.trainable = True
+base_model.trainable = True  # 전체 레이어 학습 허용
 
-# 일부 레이어만 학습 가능하게
-fine_tune_at = 50
-for layer in base_model.layers[:fine_tune_at]:
-    layer.trainable = False
-
-# 모델 구성
+# 5. 모델 구성
 model = models.Sequential([
     base_model,
     layers.GlobalAveragePooling2D(),
-    layers.Dropout(0.3),
-    layers.Dense(128, activation='relu'),
-    layers.Dense(train_data.num_classes, activation='softmax')
+    layers.BatchNormalization(),
+    layers.Dropout(0.2),
+    layers.Dense(256, activation='relu'),
+    layers.Dropout(0.2),
+    layers.Dense(train_data.num_classes, activation='softmax')  # 클래스 수만큼 출력
 ])
 
+# 6. 모델 컴파일
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    optimizer=tf.keras.optimizers.Adam(learning_rate=2e-4),
     loss='categorical_crossentropy',
     metrics=['accuracy']
 )
 
-# 콜백 설정
+# 7. 콜백 설정: 조기 종료 + 체크포인트 저장
 callbacks = [
     EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
     ModelCheckpoint("best_trash_classifier.keras", save_best_only=True)
 ]
 
-# 모델 학습
+# 8. 학습 시작
 history = model.fit(
     train_data,
     validation_data=val_data,
-    epochs=20,
+    epochs=40,
     callbacks=callbacks,
-    class_weight=class_weights,
-    verbose=2 #에폭 단위로만 로그 출력 - 정신 없어서 추가
+    verbose=1  # 출력 방식 설정 (0, 1, 2 가능)
 )
 
-# 모델 저장
-model.save("trash_classifier.keras")
+# 9. 모델 저장
+model.save("final_trash_classifier.keras")
 
-# 예측 및 평가
+# 10. 성능 평가
 val_data.reset()
 pred_probs = model.predict(val_data)
 pred_classes = np.argmax(pred_probs, axis=1)
 true_classes = val_data.classes
 class_labels = list(val_data.class_indices.keys())
 
-# 혼동 행렬
+# 11. 혼동 행렬 출력
 cm = confusion_matrix(true_classes, pred_classes)
 disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_labels)
 disp.plot(xticks_rotation=45, cmap=plt.cm.Blues)
 plt.title("Confusion Matrix")
 plt.show()
 
-# 분류 리포트
+# 12. 분류 리포트 출력
 print("\nClassification Report:")
 print(classification_report(true_classes, pred_classes, target_names=class_labels))
+
+
+# 학습 후 자동 변환 
+model.save("final_trash_classifier.keras")
