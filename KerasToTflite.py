@@ -1,19 +1,20 @@
 import tensorflow as tf
+import keras
 
-# 저장된 Keras 모델 로드
-model = tf.keras.models.load_model("final_trash_classifier.keras")
+# 1. 모델 불러오기
+model = keras.models.load_model("final_trash_classifier.keras")
 
-# TFLite 변환기 생성
+# 2. 변환기 설정
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
 
-# 최적화 (선택사항, 용량 줄이기)
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
+# 3. 변환 옵션 (에러 회피용)
+converter._experimental_lower_tensor_list_ops = False  # 이 옵션이 없는 경우 생략
 
-# TFLite 모델로 변환
+# 4. 변환 실행
 tflite_model = converter.convert()
 
-# .tflite 파일로 저장
+# 5. 저장
 with open("trash_classifier.tflite", "wb") as f:
     f.write(tflite_model)
 
-print("TFLite model saved: trash_classifier.tflite")
+print("TFLite 변환 성공!")
