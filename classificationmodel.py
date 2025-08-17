@@ -1,165 +1,189 @@
+# fast_trash_train_and_export.py
+import os, json, math
 import tensorflow as tf
+from tensorflow.keras import layers, models
 from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras import layers, models, Input
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
-import matplotlib.pyplot as plt
+from tensorflow.data import AUTOTUNE
 import numpy as np
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, classification_report
+import matplotlib.pyplot as plt
 
-# 1. 경로 설정
-train_dir = 'train'
-val_dir = 'valid'
+# --- 파라미터 조절
+IMG_SIZE = 192          # 224 -> 192로 내려 속도↑(원하면 160/224 조절)
+ALPHA    = 0.75         # MobileNetV2 폭: 1.0(기본)보다 0.75/0.5가 더 가벼움
+BATCH    = 32
+EPOCHS_WARMUP = 3       # 베이스 동결 워밍업
+EPOCHS_FINETUNE = 20    # 파인튜닝
+LEARN_WARMUP = 3e-4
+LEARN_FINETUNE = 2e-4
+MIXED_PRECISION = False # GPU면 True 권장. CPU는 보통 이득 적음.
+# =========================================
 
-# 2. 데이터 전처리 및 증강 설정
-train_gen = ImageDataGenerator(
-    rescale=1./255,
-    rotation_range=30,
-    zoom_range=0.3,
-    width_shift_range=0.2,
-    height_shift_range=0.2,
-    shear_range=0.2,
-    horizontal_flip=True,
-    brightness_range=[0.8, 1.2],
-    fill_mode='nearest'
-)
-val_gen = ImageDataGenerator(rescale=1./255)
+from pathlib import Path
 
-train_data = train_gen.flow_from_directory(
-    train_dir, target_size=(224, 224), batch_size=32, class_mode='categorical', shuffle=True)
+DATA_ROOT = Path(r"C:\Users\rkddn\trash.v1i.folder")   # <- 여기에 옮긴 경로
+train_dir = str((DATA_ROOT / "train").resolve())
+valid_dir = str((DATA_ROOT / "valid").resolve())
+test_dir  = str((DATA_ROOT / "test").resolve())  # 없으면 무시됨
 
-val_data = val_gen.flow_from_directory(
-    val_dir, target_size=(224, 224), batch_size=32, class_mode='categorical', shuffle=False)
+# (선택) 빠른 체크
+for p in [train_dir, valid_dir]:
+    if not Path(p).exists():
+        raise FileNotFoundError(f"경로 없음: {p}")
 
-# 3. Functional API 모델 정의
-def create_model(num_classes):
-    inputs = Input(shape=(224, 224, 3))
-    base_model = MobileNetV2(weights='imagenet', include_top=False, input_tensor=inputs)
-    base_model.trainable = True
 
-    x = base_model.output
-    x = layers.GlobalAveragePooling2D()(x)
+if MIXED_PRECISION:
+    tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
+# -------- tf.data로 로딩 (빠름) --------
+def make_ds(root, shuffle, batch, img_size):
+    ds = tf.keras.preprocessing.image_dataset_from_directory(
+        root,
+        image_size=(img_size, img_size),
+        label_mode="categorical",
+        batch_size=batch,
+        shuffle=shuffle
+    )
+    return ds
+
+train_ds = make_ds(train_dir, True,  BATCH, IMG_SIZE)
+val_ds   = make_ds(valid_dir, False, BATCH, IMG_SIZE)
+num_classes = train_ds.cardinality().numpy()  # cardinality는 배치 수
+class_names = train_ds.class_names
+N_CLASSES = len(class_names)
+
+# 증강- 그래프 내에서
+data_augment = tf.keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.05),
+    layers.RandomZoom(0.1),
+    layers.RandomTranslation(0.1, 0.1)
+], name="augment")
+
+# 전처리 파이프라인 (cache→shuffle→prefetch)
+def prep_train(x, y):
+    x = tf.cast(x, tf.float32) / 255.
+    x = data_augment(x, training=True)
+    return x, y
+
+def prep_eval(x, y):
+    x = tf.cast(x, tf.float32) / 255.
+    return x, y
+
+train_ds = (train_ds
+            .map(prep_train, num_parallel_calls=AUTOTUNE)
+            .cache()
+            .prefetch(AUTOTUNE))
+
+val_ds = (val_ds
+          .map(prep_eval, num_parallel_calls=AUTOTUNE)
+          .cache()
+          .prefetch(AUTOTUNE))
+
+# 여기부터 모델
+def build_model(n_classes):
+    inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    base = MobileNetV2(
+        input_tensor=inputs,
+        include_top=False,
+        weights="imagenet",
+        alpha=ALPHA
+    )
+    x = layers.GlobalAveragePooling2D()(base.output)
     x = layers.BatchNormalization()(x)
     x = layers.Dropout(0.2)(x)
-    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dense(256, activation="relu")(x)
     x = layers.Dropout(0.2)(x)
-    outputs = layers.Dense(num_classes, activation='softmax')(x)
+    outputs = layers.Dense(n_classes, activation="softmax", dtype="float32")(x)  # mixed일 때 출력은 float32로
 
-    model = models.Model(inputs=inputs, outputs=outputs)
+    model = models.Model(inputs, outputs)
     return model
 
-model = create_model(train_data.num_classes)
+model = build_model(N_CLASSES)
 
-# 4. 컴파일
-model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=2e-4),
-    loss='categorical_crossentropy',
-    metrics=['accuracy']
-)
-
-# 5. 콜백 설정
+# -------- 콜백 ----------
+ckpt_path = "best_trash_classifier.keras"
 callbacks = [
-    EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-    ModelCheckpoint("best_trash_classifier.keras", save_best_only=True)
+    tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+    tf.keras.callbacks.ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True)
 ]
 
-# 6. 학습
-model.fit(train_data, validation_data=val_data, epochs=40, callbacks=callbacks, verbose=1)
+# -------- 1) 워밍업(베이스 동결) --------
+for layer in model.layers:
+    if isinstance(layer, tf.keras.Model) or "mobilenetv2" in layer.name:
+        layer.trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(LEARN_WARMUP),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_WARMUP, callbacks=callbacks, verbose=1)
+
+# -------- 2) 파인튜닝(상위 블록만 풀기) --------
+# MobileNetV2의 끝쪽 블록 몇 개만 학습(속도와 안정성 균형)
+for layer in model.layers:
+    if "block_" in layer.name:
+        # block_12 ~ block_16 정도만 학습
+        try:
+            block_idx = int(layer.name.split("block_")[1].split("_")[0])
+            layer.trainable = (block_idx >= 12)
+        except:
+            pass
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(LEARN_FINETUNE),
+    loss="categorical_crossentropy",
+    metrics=["accuracy"]
+)
+model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINETUNE, callbacks=callbacks, verbose=1)
+
+# 최종 저장
 model.save("final_trash_classifier.keras")
 
+# -------- 검증셋 평가/리포트(빠른 확인) --------
+val_np = list(val_ds.unbatch().as_numpy_iterator())
+xv = np.stack([a for a, _ in val_np])
+yv = np.stack([b for _, b in val_np])
+pred = model.predict(val_ds, verbose=0)
+pred_cls = pred.argmax(1)
+true_cls = yv.argmax(1)
 
-# import tensorflow as tf
-# from tensorflow.keras.preprocessing.image import ImageDataGenerator
-# from tensorflow.keras.applications import MobileNetV2
-# from tensorflow.keras import layers, models
-# from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-# from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
-# import matplotlib.pyplot as plt
-# import numpy as np
-
-# # 1. 경로 설정
-# train_dir = 'train'
-# val_dir = 'valid'
-
-# # 2. 데이터 전처리 및 증강 설정
-# train_gen = ImageDataGenerator(
-#     rescale=1./255,  # 정규화
-#     rotation_range=30,
-#     zoom_range=0.3,
-#     width_shift_range=0.2,
-#     height_shift_range=0.2,
-#     shear_range=0.2,
-#     horizontal_flip=True,
-#     brightness_range=[0.8, 1.2],
-#     fill_mode='nearest'
-# )
-# val_gen = ImageDataGenerator(rescale=1./255)
-
-# # 3. 이미지 불러오기
-# train_data = train_gen.flow_from_directory(
-#     train_dir, target_size=(224, 224), batch_size=32, class_mode='categorical', shuffle=True)
-
-# val_data = val_gen.flow_from_directory(
-#     val_dir, target_size=(224, 224), batch_size=32, class_mode='categorical', shuffle=False)
-
-# # 4. 사전학습된 MobileNetV2 기반 전이학습 (Transfer Learning)
-# base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-# base_model.trainable = True  # 전체 레이어 학습 허용
-
-# # 5. 모델 구성
-# model = models.Sequential([
-#     base_model,
-#     layers.GlobalAveragePooling2D(),
-#     layers.BatchNormalization(),
-#     layers.Dropout(0.2),
-#     layers.Dense(256, activation='relu'),
-#     layers.Dropout(0.2),
-#     layers.Dense(train_data.num_classes, activation='softmax')  # 클래스 수만큼 출력
-# ])
-
-# # 6. 모델 컴파일
-# model.compile(
-#     optimizer=tf.keras.optimizers.Adam(learning_rate=2e-4),
-#     loss='categorical_crossentropy',
-#     metrics=['accuracy']
-# )
-
-# # 7. 콜백 설정: 조기 종료 + 체크포인트 저장
-# callbacks = [
-#     EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-#     ModelCheckpoint("best_trash_classifier.keras", save_best_only=True)
-# ]
-
-# # 8. 학습 시작
-# history = model.fit(
-#     train_data,
-#     validation_data=val_data,
-#     epochs=40,
-#     callbacks=callbacks,
-#     verbose=1  # 출력 방식 설정 (0, 1, 2 가능)
-# )
-
-# # 9. 모델 저장
-# model.save("final_trash_classifier.keras")
-
-# 10. 성능 평가
-val_data.reset()
-pred_probs = model.predict(val_data)
-pred_classes = np.argmax(pred_probs, axis=1)
-true_classes = val_data.classes
-class_labels = list(val_data.class_indices.keys())
-
-# 11. 혼동 행렬 출력
-cm = confusion_matrix(true_classes, pred_classes)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_labels)
+cm = confusion_matrix(true_cls, pred_cls)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
 disp.plot(xticks_rotation=45, cmap=plt.cm.Blues)
-plt.title("Confusion Matrix")
+plt.title("Confusion Matrix (VALID)")
 plt.show()
 
-# 12. 분류 리포트 출력
-print("\nClassification Report:")
-print(classification_report(true_classes, pred_classes, target_names=class_labels))
+print("\nClassification Report (VALID):")
+print(classification_report(true_cls, pred_cls, target_names=class_names))
 
+# -------- (선택) TEST셋 평가 --------
+if os.path.isdir(test_dir):
+    test_ds = make_ds(test_dir, False, BATCH, IMG_SIZE)
+    test_ds = test_ds.map(prep_eval, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
+    print("\nTest evaluation:")
+    model.evaluate(test_ds, verbose=1)
 
-# # 학습 후 자동 변환 
-# model.save("final_trash_classifier.keras")
+# -------- TFLite 변환 (빠르고 안전한 from_keras_model) --------
+def export_tflite(m, fname="trash_classifier.tflite", quant="dynamic"):
+    converter = tf.lite.TFLiteConverter.from_keras_model(m)
+    if quant == "dynamic":
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    elif quant == "float16":
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.target_spec.supported_types = [tf.float16]
+    tflite_model = converter.convert()
+    with open(fname, "wb") as f:
+        f.write(tflite_model)
+    print(f"TFLite saved → {fname}")
+
+# 기본: 동적 양자화(대부분 CPU에서 속도/크기 이득)
+export_tflite(model, "trash_classifier_dynamic.tflite", quant="dynamic")
+# 용량 더 줄이고 싶으면(모바일 GPU/NNAPI에서 빠른 편)
+export_tflite(model, "trash_classifier_fp16.tflite", quant="float16")
+
+# 라벨 저장(모바일에서 사용)
+with open("labels.json", "w", encoding="utf-8") as f:
+    json.dump(class_names, f, ensure_ascii=False, indent=2)
+print("labels.json saved.")
